@@ -1,0 +1,166 @@
+name: Ninye Harvester
+
+on:
+  schedule:
+    # GitHub Actions checks every 5 minutes. The job itself only performs the
+    # real harvest when the configured interval (data/harvest_settings.json ->
+    # interval_minutes) has elapsed since the last completed sync.
+    # workflow_dispatch always runs immediately, regardless of the timer.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# This runner repo stores no data and pushes nothing to itself. All writes go
+# to Vicdara/YouTube-Shorts-P-Words-Intelligence using MAIN_REPO_TOKEN, which
+# is set as origin's URL in the final step.
+permissions:
+  contents: none
+
+# Two harvests must never race on the same `data/` push.
+concurrency:
+  group: ninye-harvest
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    env:
+      # Comma-separated YouTube Data API v3 key pool, passed through to the
+      # harvester exactly as the existing main-repo workflow does.
+      YOUTUBE_API_KEYS: ${{ secrets.YOUTUBE_API_KEYS }}
+
+    steps:
+      - name: Check out the real project repo
+        uses: actions/checkout@v4
+        with:
+          repository: Vicdara/YouTube-Shorts-P-Words-Intelligence
+          ref: main
+          token: ${{ secrets.MAIN_REPO_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Read settings and decide if harvest is due
+        id: settings
+        run: |
+          # Read harvest_settings.json with safe defaults (file may be missing
+          # on a fresh project repo). Defaults match the main project:
+          #   enabled=true, interval_minutes=30, workers_count=3, harvest_mode=delta
+          ENABLED=$(jq -r '.enabled // true' data/harvest_settings.json 2>/dev/null || echo true)
+          INTERVAL=$(jq -r '.interval_minutes // 30' data/harvest_settings.json 2>/dev/null || echo 30)
+          WORKERS=$(jq -r '.workers_count // 3' data/harvest_settings.json 2>/dev/null || echo 3)
+          MODE=$(jq -r '.harvest_mode // "delta"' data/harvest_settings.json 2>/dev/null || echo delta)
+
+          # Last completed sync = last time summary_data.json was regenerated.
+          # summary_data.metadata.last_updated is an ISO 8601 timestamp.
+          LAST=$(jq -r '.metadata.last_updated // "1970-01-01T00:00:00+00:00"' data/summary_data.json 2>/dev/null || echo "1970-01-01T00:00:00+00:00")
+          NOW=$(date -u +%s)
+          LAST_TS=$(date -u -d "$LAST" +%s 2>/dev/null || echo 0)
+          ELAPSED=$(( (NOW - LAST_TS) / 60 ))
+
+          # Manual dispatch always runs immediately, regardless of timer.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger - running harvest immediately (interval=${INTERVAL}m, workers=${WORKERS}, mode=${MODE})."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          elif [ "$ENABLED" != "true" ]; then
+            echo "Auto-harvest is PAUSED in data/harvest_settings.json. Skipping."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          elif [ "$ELAPSED" -ge "$INTERVAL" ]; then
+            echo "Harvest DUE: last sync ${ELAPSED} min ago >= interval ${INTERVAL} min. Running."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "Harvest not due yet (${ELAPSED}/${INTERVAL} min). Next check in 5 minutes."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Map harvest_mode -> engine instances.
+          # API workers (workers_count) always run; mode toggles yt-dlp + scrapers.
+          # This matches the existing main-repo workflow exactly:
+          #   delta   -> API workers only                (ytdlp=0, scrapers=0)
+          #   reverse -> API workers + web scrapers      (ytdlp=0, scrapers=2)
+          #   full    -> API workers + yt-dlp + scrapers (ytdlp=2, scrapers=2)
+          case "$MODE" in
+            reverse) YTDLP=0; SCRAPERS=2 ;;
+            full)    YTDLP=2; SCRAPERS=2 ;;
+            *)       YTDLP=0; SCRAPERS=0 ;;
+          esac
+
+          echo "workers=$WORKERS"   >> $GITHUB_OUTPUT
+          echo "ytdlp=$YTDLP"       >> $GITHUB_OUTPUT
+          echo "scrapers=$SCRAPERS" >> $GITHUB_OUTPUT
+          echo "mode=$MODE"         >> $GITHUB_OUTPUT
+
+      - name: Set up Python 3.11
+        if: steps.settings.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install dependencies
+        if: steps.settings.outputs.should_run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Run Ninye Harvester
+        if: steps.settings.outputs.should_run == 'true'
+        run: |
+          echo "Mode: ${{ steps.settings.outputs.mode }} | workers=${{ steps.settings.outputs.workers }} | yt-dlp=${{ steps.settings.outputs.ytdlp }} | scrapers=${{ steps.settings.outputs.scrapers }}"
+          python scripts/unified_harvester.py \
+            "${{ steps.settings.outputs.workers }}" \
+            "${{ steps.settings.outputs.ytdlp }}" \
+            "${{ steps.settings.outputs.scrapers }}"
+
+      - name: Update reports and summary data
+        if: steps.settings.outputs.should_run == 'true'
+        run: |
+          python scripts/update_reports.py
+
+      - name: Commit and push data/ back to the main project repo (with rebase retry)
+        if: steps.settings.outputs.should_run == 'true'
+        env:
+          MAIN_REPO_TOKEN: ${{ secrets.MAIN_REPO_TOKEN }}
+        run: |
+          set -e
+          git config user.name  "ninye-runner[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage ONLY the harvest output. No code, no configs, no secrets.
+          git add data/
+
+          if git diff --staged --quiet; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git commit -m "chore(data): ninye-runner harvest sync ${TIMESTAMP} [mode=${{ steps.settings.outputs.mode }}] [skip ci]"
+
+          # Push back to Vicdara/YouTube-Shorts-P-Words-Intelligence using
+          # MAIN_REPO_TOKEN. actions/checkout already configured `origin` with
+          # this token, but we set it explicitly so the URL is unambiguous
+          # after any rebase.
+          REPO_URL="https://x-access-token:${MAIN_REPO_TOKEN}@github.com/Vicdara/YouTube-Shorts-P-Words-Intelligence.git"
+          git remote set-url origin "$REPO_URL"
+
+          for i in 1 2 3 4 5; do
+            echo "=== Push attempt $i/5 ==="
+            if git push origin main; then
+              echo "Push succeeded on attempt $i."
+              exit 0
+            fi
+            echo "Push attempt $i failed - fetching latest and rebasing..."
+            git fetch origin main
+            if git rebase origin/main; then
+              echo "Rebase succeeded - retrying push."
+              sleep $((i * 5))
+              continue
+            else
+              echo "Rebase conflict on data/ - aborting this run's commit. Next run will catch up."
+              git rebase --abort
+              exit 0
+            fi
+          done
+
+          echo "Could not push after 5 attempts."
+          exit 1
