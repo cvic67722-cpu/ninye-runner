@@ -2,12 +2,12 @@ name: Ninye Harvester
 
 on:
   schedule:
-    # GitHub Actions checks about every 10 minutes (at 3,13,23,33,43,53 past
-    # the hour). The job itself only performs the real harvest when the
+    # GitHub Actions checks every 5 minutes (most reliable high-frequency cron).
+    # The job itself only performs the real harvest when the
     # configured interval (data/harvest_settings.json -> interval_minutes) has
     # elapsed since the last completed sync.
     # workflow_dispatch always runs immediately, regardless of the timer.
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 # This runner repo stores no data and pushes nothing to itself. All writes go
@@ -68,7 +68,7 @@ jobs:
             echo "Harvest DUE: last sync ${ELAPSED} min ago >= interval ${INTERVAL} min. Running."
             echo "should_run=true" >> $GITHUB_OUTPUT
           else
-            echo "Harvest not due yet (${ELAPSED}/${INTERVAL} min). Next check in ~10 minutes."
+            echo "Harvest not due yet (${ELAPSED}/${INTERVAL} min). Next check in 5 minutes."
             echo "should_run=false" >> $GITHUB_OUTPUT
           fi
 
