@@ -114,7 +114,7 @@ jobs:
           git config user.name "ninye-poster[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/post_runs.jsonl
-          git remote set-url origin "https://x-access-token:${{ secrets.MAIN_REPO_TOKEN }}@github.com/Vicdara/YouTube-Shorts-P-Words-Intelligence.git"r
+          git remote set-url origin "https://x-access-token:${{ secrets.MAIN_REPO_TOKEN }}@github.com/Vicdara/YouTube-Shorts-P-Words-Intelligence.git"
 
           if git diff --staged --quiet; then
             echo "No post-run log changes."
