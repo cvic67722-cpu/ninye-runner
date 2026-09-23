@@ -1,0 +1,130 @@
+name: 📮 Parallel Poster — queue words via post-comment
+
+# Drains data/unguessed_queue.json safely:
+# - every 30 min, one cycle; each matrix job = one account shard
+# - disjoint split (word index % num_accounts) so each word posts once
+# - re-verifies via bulk check-words before posting; jitter 30-90s between posts
+# - stops a shard early on quota/spam signals; per-cycle log -> data/post_runs.jsonl
+# - scales automatically: job count = connected accounts (capped by max-parallel)
+#
+# Required secrets:
+#   NINYE_API_BASE  e.g. https://ninye-tracker.vercel.app
+#   ADMIN_TOKEN     only if the server enforces x-admin-token (else leave unset)
+#
+# Manual: workflow_dispatch with optional words_per_cycle override.
+
+on:
+  schedule:
+    - cron: '7,37 * * * *' # offset from harvester (:00/:30) to avoid push races
+  workflow_dispatch:
+    inputs:
+      words_per_cycle:
+        description: 'Words per cycle (1-20)'
+        required: false
+        default: '20'
+      dry_run:
+        description: 'Plan only (1 = no posting)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ninye-poster
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.accounts.outputs.matrix }}
+      count: ${{ steps.accounts.outputs.count }}
+      cursor: ${{ steps.accounts.outputs.cursor }}
+    steps:
+      - name: Resolve posting accounts
+        id: accounts
+        env:
+          NINYE_API_BASE: ${{ secrets.NINYE_API_BASE }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          base = os.environ["NINYE_API_BASE"].rstrip("/")
+          req = urllib.request.Request(base + "/api/accounts", headers={"User-Agent": "Ninye-Poster-Plan"})
+          with urllib.request.urlopen(req, timeout=30) as res:
+              data = json.loads(res.read().decode())
+          posters = [a for a in data.get("accounts", []) if a.get("can_post")]
+          idx = list(range(len(posters)))
+          print(f"posting accounts: {len(posters)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps(idx)}\n")
+              f.write(f"count={len(posters)}\n")
+          # cursor for the log line (queue read is cheap; poster re-reads it)
+          try:
+              qreq = urllib.request.Request(base + "/api/public/queue?limit=1", headers={"User-Agent": "Ninye-Poster-Plan"})
+              with urllib.request.urlopen(qreq, timeout=30) as qres:
+                  q = json.loads(qres.read().decode())
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"cursor={q.get('cursor', 0)}\n")
+          except Exception as e:
+              print(f"queue cursor lookup failed: {e}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("cursor=0\n")
+          EOF
+
+  post:
+    needs: plan
+    if: ${{ needs.plan.outputs.count > 0 }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        account_index: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      NINYE_API_BASE: ${{ secrets.NINYE_API_BASE }}
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+      WORDS_PER_CYCLE: ${{ inputs.words_per_cycle || '20' }}
+      ACCOUNT_INDEX: ${{ matrix.account_index }}
+      ACCOUNT_COUNT: ${{ needs.plan.outputs.count }}
+      JITTER_MIN_S: '30'
+      JITTER_MAX_S: '90'
+      DRY_RUN: ${{ inputs.dry_run || '0' }}
+    steps:
+      - name: 📥 Check out the real project repo
+        uses: actions/checkout@v4
+        with:
+          repository: Vicdara/YouTube-Shorts-P-Words-Intelligence
+          ref: main
+          token: ${{ secrets.MAIN_REPO_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📮 Post shard (20 words, jittered, early-stop on quota/spam)
+        run: |
+          python3 scripts/parallel_poster.py
+
+      - name: 💾 Commit post_runs.jsonl (with retry)
+        run: |
+          git config user.name "ninye-poster[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/post_runs.jsonl
+          git remote set-url origin "https://x-access-token:${{ secrets.MAIN_REPO_TOKEN }}@github.com/Vicdara/YouTube-Shorts-P-Words-Intelligence.git"r
+
+          if git diff --staged --quiet; then
+            echo "No post-run log changes."
+            exit 0
+          fi
+          git commit -m "chore(posts): ninye-poster shard ${{ matrix.account_index }} cycle log [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git push origin main; then echo "Push ok (attempt $i)"; exit 0; fi
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 0; }
+            sleep $((i * 5))
+          done
+          echo "Push failed after 5 attempts (next cycle will retry)"; exit 0
