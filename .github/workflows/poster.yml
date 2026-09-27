@@ -84,15 +84,27 @@ jobs:
               echo "Push succeeded on attempt $i."
               exit 0
             fi
-            echo "Push attempt $i failed - fetching latest and rebasing..."
+            echo "Push attempt $i failed - fetching latest and merging..."
             git fetch origin main
-            if git rebase origin/main; then
-              echo "Rebase succeeded - retrying push."
+            # State files (cursor + run log) are append-only counters: on
+            # conflict keep the HARVESTER side (oauth/summary/queue data) and
+            # re-apply OUR cycle on top, so the run log line is never lost.
+            # Seen 2026-09-27: rebase --abort dropped the 4-post cycle row.
+            git stash push -m "poster-cycle-state" -- data/post_runs.jsonl data/post_queue_state.json
+            if git merge origin/main -m "merge(remote): harvester sync under poster cycle [skip ci]"; then
+              git stash pop || true
+              git add data/post_runs.jsonl data/post_queue_state.json
+              if git diff --staged --quiet; then
+                echo "State already covered by remote - nothing to re-apply."
+                exit 0
+              fi
+              git commit -m "chore(posts): cycle log + cursor advance (re-applied over harvester sync) [skip ci]"
               sleep $((i * 5))
               continue
             else
-              echo "Rebase conflict - aborting this run's commit. Next run will catch up."
-              git rebase --abort
+              echo "Merge conflict beyond state files - aborting, next run catches up."
+              git merge --abort || true
+              git stash pop || true
               exit 0
             fi
           done
