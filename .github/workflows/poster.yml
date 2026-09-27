@@ -1,4 +1,4 @@
-name: ðŸ“® Simple Poster â€” queue words via one batch API call
+name:  Simple Poster  queue words via one batch API call
 
 # One cycle, one job, one API call:
 # - every 30 min (:07/:37, offset from harvester to avoid push races)
@@ -47,7 +47,7 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run || '0' }}
       POSTER_PUSH_TOKEN: ${{ secrets.MAIN_REPO_TOKEN }}
     steps:
-      - name: ðŸ“¥ Check out the real project repo
+      - name:  Check out the real project repo
         uses: actions/checkout@v4
         with:
           repository: Vicdara/YouTube-Shorts-P-Words-Intelligence
@@ -56,16 +56,16 @@ jobs:
           fetch-depth: 1
           persist-credentials: true
 
-      - name: ðŸ Set up Python
+      - name:  Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: ðŸ“® Post batch (one API call, server-side rotation + jitter)
+      - name:  Post batch (one API call, server-side rotation + jitter)
         run: |
           python3 scripts/simple_poster.py
 
-      - name: ðŸ’¾ Commit cursor + run log (with retry)
+      - name: ' Commit cursor + run log (with retry)
         run: |
           set -e
           git config user.name "ninye-poster[bot]"
