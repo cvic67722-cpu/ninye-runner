@@ -86,27 +86,72 @@ jobs:
             fi
             echo "Push attempt $i failed - fetching latest and merging..."
             git fetch origin main
-            # State files (cursor + run log) are append-only counters: on
-            # conflict keep the HARVESTER side (oauth/summary/queue data) and
-            # re-apply OUR cycle on top, so the run log line is never lost.
-            # Seen 2026-09-27: rebase --abort dropped the 4-post cycle row.
-            git stash push -m "poster-cycle-state" -- data/post_runs.jsonl data/post_queue_state.json
+            # State files are append-only counters that ALWAYS conflict-merge
+            # cleanly when combined correctly:
+            #   post_runs.jsonl      -> union of lines (dedupe by ts)
+            #   post_queue_state.json -> max(cursor)
+            # So: save OUR versions, merge remote, then re-apply the union.
+            # Seen 2026-09-27/28: stash+merge --abort dropped every cycle row
+            # (12-post 21:32 run lost although 12 comments went live).
+            cp data/post_runs.jsonl /tmp/ours_runs.jsonl
+            cp data/post_queue_state.json /tmp/ours_state.json
             if git merge origin/main -m "merge(remote): harvester sync under poster cycle [skip ci]"; then
-              git stash pop || true
-              git add data/post_runs.jsonl data/post_queue_state.json
-              if git diff --staged --quiet; then
-                echo "State already covered by remote - nothing to re-apply."
+              MERGED=true
+            else
+              echo "Merge conflict - resolving state files by union, keeping remote for the rest."
+              git checkout --theirs -- data/post_runs.jsonl data/post_queue_state.json || true
+              git checkout --ours -- . || true
+              git add -A
+              if ! git -c core.editor=true merge --continue; then
+                echo "Merge --continue failed - aborting, next run catches up."
+                git merge --abort || true
+                cp /tmp/ours_runs.jsonl data/post_runs.jsonl
+                cp /tmp/ours_state.json data/post_queue_state.json
                 exit 0
               fi
-              git commit -m "chore(posts): cycle log + cursor advance (re-applied over harvester sync) [skip ci]"
-              sleep $((i * 5))
-              continue
-            else
-              echo "Merge conflict beyond state files - aborting, next run catches up."
-              git merge --abort || true
-              git stash pop || true
+              MERGED=true
+            fi
+            python3 - "$GITHUB_WORKSPACE" <<'PYEOF'
+            import json, os
+            root = os.environ.get("GITHUB_WORKSPACE", ".")
+            def load_lines(p):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        return [l for l in f.read().splitlines() if l.strip()]
+                except OSError:
+                    return []
+            ours = load_lines("/tmp/ours_runs.jsonl")
+            merged = load_lines(os.path.join(root, "data/post_runs.jsonl"))
+            seen, union = set(), []
+            for line in merged + ours:
+                try:
+                    ts = json.loads(line).get("ts", line[:80])
+                except Exception:
+                    ts = line[:80]
+                if ts not in seen:
+                    seen.add(ts)
+                    union.append(line)
+            with open(os.path.join(root, "data/post_runs.jsonl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(union) + "\n")
+            def load_cursor(p):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        return int(json.load(f).get("cursor", 0) or 0)
+                except Exception:
+                    return 0
+            final = max(load_cursor("/tmp/ours_state.json"), load_cursor(os.path.join(root, "data/post_queue_state.json")))
+            with open(os.path.join(root, "data/post_queue_state.json"), "w", encoding="utf-8") as f:
+                json.dump({"cursor": final, "batch_size": 6, "updated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), "updated_by": "simple-poster"}, f, ensure_ascii=False, indent=2)
+            print(f"State union done: runs={len(union)} cursor={final}")
+            PYEOF
+            git add data/post_runs.jsonl data/post_queue_state.json
+            if git diff --staged --quiet; then
+              echo "State already covered by remote - nothing to re-apply."
               exit 0
             fi
+            git commit -m "chore(posts): cycle log + cursor advance (union over harvester sync) [skip ci]"
+            sleep $((i * 5))
+            continue
           done
           echo "Could not push after 5 attempts."
           exit 1
