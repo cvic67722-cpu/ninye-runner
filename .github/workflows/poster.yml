@@ -105,40 +105,7 @@ jobs:
               fi
               MERGED=true
             fi
-            python3 - "$GITHUB_WORKSPACE" <<'PYEOF'
-            import json, os
-            root = os.environ.get("GITHUB_WORKSPACE", ".")
-            def load_lines(p):
-                try:
-                    with open(p, encoding="utf-8") as f:
-                        return [l for l in f.read().splitlines() if l.strip()]
-                except OSError:
-                    return []
-            ours = load_lines("/tmp/ours_runs.jsonl")
-            merged = load_lines(os.path.join(root, "data/post_runs.jsonl"))
-            seen, union = set(), []
-            for line in merged + ours:
-                try:
-                    ts = json.loads(line).get("ts", line[:80])
-                except Exception:
-                    ts = line[:80]
-                if ts not in seen:
-                    seen.add(ts)
-                    union.append(line)
-            with open(os.path.join(root, "data/post_runs.jsonl"), "w", encoding="utf-8") as f:
-                f.write("\n".join(union) + "\n")
-            def load_cursor(p):
-                try:
-                    with open(p, encoding="utf-8") as f:
-                        return int(json.load(f).get("cursor", 0) or 0)
-                except Exception:
-                    return 0
-            import datetime
-            final = max(load_cursor("/tmp/ours_state.json"), load_cursor(os.path.join(root, "data/post_queue_state.json")))
-            with open(os.path.join(root, "data/post_queue_state.json"), "w", encoding="utf-8") as f:
-                json.dump({"cursor": final, "batch_size": 6, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "updated_by": "simple-poster"}, f, ensure_ascii=False, indent=2)
-            print("State union done: runs=%d cursor=%d" % (len(union), final))
-            PYEOF
+            python3 scripts/union_poster_state.py
             git add data/post_runs.jsonl data/post_queue_state.json
             if git diff --staged --quiet; then
               echo "State already covered by remote - nothing to re-apply."
