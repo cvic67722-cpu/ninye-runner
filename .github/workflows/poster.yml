@@ -43,7 +43,7 @@ jobs:
       NINYE_API_BASE: ${{ secrets.NINYE_API_BASE }}
       ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
       BATCH_WORDS: ${{ inputs.batch_words || '6' }}
-      DELAY_MS: '1000'
+      DELAY_MS: '3000'  # bumped 2026-10-31 — gentler pacing reduces per-comment 403s
       DRY_RUN: ${{ inputs.dry_run || '0' }}
       POSTER_PUSH_TOKEN: ${{ secrets.MAIN_REPO_TOKEN }}
     steps:
